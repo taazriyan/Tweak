@@ -1,6 +1,10 @@
-<!doctype html><html><head><meta charset=utf8><meta name=viewport content="width=device-width,initial-scale=1,viewport-fit=cover"><style>:root{color-scheme:light;box-sizing:border-box;padding-top:env(safe-area-inset-top,0px);padding-bottom:env(safe-area-inset-bottom,0px)}html{scroll-padding-top:env(safe-area-inset-top,0px)}body{margin:0;padding:0;font:14px -apple-system,BlinkMacSystemFont,sans-serif;background:#fff;color:#000}img{max-width:100%}[hidden]:not([hidden=until-found i]){display:none!important}</style></head><body>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>Tweak</title>
-<meta name="claude:viewport-fit-sides" content="cover">
+<meta name="description" content="Turn client feedback messages and files into numbered tasks, organized by project and feedback phase.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600&family=IBM+Plex+Mono:wght@500&display=swap">
@@ -20,6 +24,9 @@
   color-scheme:light;
 }
 *{box-sizing:border-box;scrollbar-width:none}
+body{margin:0}
+img{max-width:100%}
+[hidden]{display:none!important}
 *::-webkit-scrollbar{display:none;width:0;height:0}
 html,body{height:100%}
 body{background:var(--page);color:var(--text);font:400 14px/1.4 var(--f-ui);-webkit-font-smoothing:antialiased}
@@ -210,6 +217,8 @@ button{cursor:pointer}
 .fmeta{display:flex;align-items:center;gap:8px;font-size:14px;line-height:1.2;letter-spacing:.07px;color:var(--muted)}
 .fmeta .ok{color:var(--done)} .fmeta .warn{color:var(--ask)}
 .m-note{margin:0;padding:10px 12px;border-radius:12px;background:var(--ask-bg);font-size:13px;line-height:18px}
+.m-ai{margin:-10px 0 0;font-size:13px;line-height:18px;color:var(--text-2);text-align:center}
+.m-ai .link{font-size:13px}
 .m-sub{margin:-16px 0 0;font-size:14px;line-height:18px;color:var(--text-2)}
 .m-hint{margin:0;padding:0 8px;font-size:13px;line-height:18px;color:var(--text-2)}
 .textarea.tall{height:260px}
@@ -247,6 +256,8 @@ button{cursor:pointer}
 }
 @media (prefers-reduced-motion:reduce){.row.fresh,.ghost,.res,.sparks{animation:none}.spin,.cov svg{animation-duration:2.4s}}
 </style>
+</head>
+<body>
 
 <div class="page solo" id="page">
   <div class="main" id="main">
@@ -314,6 +325,7 @@ button{cursor:pointer}
       <p class="m-note" id="mNote" hidden></p>
     </div>
     <button class="btn" id="mCreate" type="button" style="width:100%">Create Tasks</button>
+    <p class="m-ai" id="mAi" hidden></p>
   </div>
 </div>
 
@@ -343,7 +355,6 @@ button{cursor:pointer}
     round: 'all', hl: null, fresh: new Map(), creating: null, renaming: null, renamingFrom: null, deleting: null,
     meta: {}, menuFor: null, renamingProj: null
   };
-  let db = null, sampleFn = null, perms = null, smart = 'checking';
   const pending = new Set();
   const local = { tasks: new Map(), batches: new Map(), meta: new Map() };
 
@@ -388,35 +399,50 @@ button{cursor:pointer}
     toastTimer = setTimeout(() => { t.hidden = true; }, actLabel ? 8000 : 3200);
   }
 
-  /* ---------- storage ---------- */
-  function syncLocal() { state.tasks = [...local.tasks.values()]; state.batches = [...local.batches.values()]; state.meta = Object.fromEntries(local.meta); render(); }
-  async function write(coll, id, data, op, retried) {
-    if (db) {
-      const ref = db.collection(coll).doc(id);
-      try {
-        if (op === 'set') await ref.set(data);
-        else if (op === 'update') await ref.update(data);
-        else await ref.delete();
-      } catch (e) {
-        if (e && e.code === 'unavailable' && !retried) { await new Promise((r) => setTimeout(r, 400 + Math.random() * 600)); return write(coll, id, data, op, true); }
-        writeError(e); throw e;
+  /* ---------- storage: everything is saved in this browser (localStorage) ---------- */
+  const STORE_KEY = 'tweak.data.v1';
+  function loadLocal() {
+    for (const c of ['tasks', 'batches', 'meta']) local[c].clear();
+    try {
+      const d = JSON.parse(localStorage.getItem(STORE_KEY) || 'null');
+      if (d && typeof d === 'object') {
+        for (const c of ['tasks', 'batches', 'meta']) for (const doc of (Array.isArray(d[c]) ? d[c] : [])) if (doc && doc.id) local[c].set(doc.id, doc);
       }
-      return;
+    } catch {}
+  }
+  let saveTimer = null, storageWarned = false;
+  function saveLocal() {
+    clearTimeout(saveTimer); saveTimer = null;
+    try {
+      localStorage.setItem(STORE_KEY, JSON.stringify({ v: 1, tasks: [...local.tasks.values()], batches: [...local.batches.values()], meta: [...local.meta.values()] }));
+    } catch {
+      if (!storageWarned) { storageWarned = true; toast('This browser couldn\'t save your changes (storage is full or blocked). They\'ll be lost when you close the page.'); }
     }
+  }
+  const queueSave = () => { if (!saveTimer) saveTimer = setTimeout(saveLocal, 150); };
+  // save right away when the page is closed or hidden
+  window.addEventListener('pagehide', () => { if (saveTimer) saveLocal(); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'hidden' && saveTimer) saveLocal(); });
+  // another tab saved: show its changes here too
+  window.addEventListener('storage', (e) => { if (e.key === STORE_KEY) { loadLocal(); syncLocal(); } });
+  // many writes in a row (a whole project) redraw the page once
+  let syncQueued = false;
+  function syncLocal() {
+    if (syncQueued) return;
+    syncQueued = true;
+    queueMicrotask(() => {
+      syncQueued = false;
+      state.tasks = [...local.tasks.values()]; state.batches = [...local.batches.values()]; state.meta = Object.fromEntries(local.meta);
+      render();
+    });
+  }
+  async function write(coll, id, data, op) {
     const m = local[coll];
     if (op === 'set') m.set(id, { id, ...data });
     else if (op === 'update') { const cur = m.get(id); if (cur) m.set(id, { ...cur, ...data }); }
     else m.delete(id);
+    queueSave();
     syncLocal();
-  }
-  let lastErr = 0;
-  function writeError(e) {
-    if (Date.now() - lastErr < 1500) return;
-    lastErr = Date.now();
-    const code = e && e.code;
-    if (code === 'invalid_argument') { state.readOnly = true; render(); toast("You can view these tasks but can't change them."); }
-    else if (code === 'quota_exceeded') toast('Storage is full. Delete some done tasks, then try again.');
-    else toast("Couldn't save that change. Check your connection and try again.");
   }
   async function guarded(id, fn) {
     if (state.readOnly || pending.has(id)) return;
@@ -565,6 +591,82 @@ button{cursor:pointer}
     })).filter((o) => o.text);
   }
 
+  /* ---------- AI: Puter.js ---------- */
+  // Each visitor signs in with their own free Puter account, and AI use counts against that account
+  // (Puter's "user-pays" model), so running this app costs you nothing. Without sign-in, or if Puter
+  // can't load, messages are split by sentence instead.
+  const PUTER_SRC = 'https://js.puter.com/v2/';
+  let ai = 'loading'; // loading | ready | signin | declined | off
+  const puterOk = () => !!(window.puter && window.puter.ai && typeof window.puter.ai.chat === 'function');
+  function loadPuter() {
+    const s = document.createElement('script');
+    s.src = PUTER_SRC; s.async = true;
+    s.onload = () => { if (puterOk()) refreshAi(); else { ai = 'off'; renderAiNote(); } };
+    s.onerror = () => { ai = 'off'; renderAiNote(); };
+    document.head.append(s);
+  }
+  function refreshAi() {
+    if (!puterOk()) return;
+    let signedIn = false;
+    try { signedIn = !!(window.puter.auth && window.puter.auth.isSignedIn()); } catch {}
+    if (signedIn) ai = 'ready';
+    else if (ai !== 'declined') ai = 'signin';
+    renderAiNote();
+  }
+  // Call this directly from a click: signing in opens Puter's popup. Resolves true when the AI can be used.
+  function ensureAi() {
+    if (!puterOk()) return Promise.resolve(false);
+    refreshAi();
+    if (ai === 'ready') return Promise.resolve(true);
+    if (ai === 'declined') return Promise.resolve(false);
+    let signing;
+    try { signing = window.puter.auth.signIn(); } catch { signing = Promise.reject(new Error('auth_failed')); }
+    return Promise.resolve(signing).then(
+      () => { refreshAi(); if (ai !== 'ready') { ai = 'declined'; renderAiNote(); } return ai === 'ready'; },
+      () => { ai = 'declined'; renderAiNote(); return false; });
+  }
+  function renderAiNote() {
+    const el = $('#mAi'); if (!el) return;
+    el.textContent = '';
+    if (ai === 'signin') el.append('Tasks are written by AI through Puter. The first time, you\'ll be asked to sign in to a free Puter account.');
+    else if (ai === 'declined') el.append('AI is off, so the message will be split by sentence. ',
+      h('button', { class: 'link', type: 'button', onclick: () => { ai = 'signin'; ensureAi(); } }, 'Sign in to Puter'));
+    else if (ai === 'off') el.append('The AI couldn\'t load, so the message will be split by sentence.');
+    el.hidden = !el.textContent;
+  }
+  // the reply's text, whatever shape the model returns it in
+  function aiText(resp) {
+    if (resp == null) return '';
+    if (typeof resp === 'string') return resp;
+    const c = resp.message && resp.message.content;
+    if (typeof c === 'string') return c;
+    if (Array.isArray(c)) return c.map((p) => (typeof p === 'string' ? p : (p && p.text) || '')).join('');
+    if (typeof resp.text === 'string') return resp.text;
+    try { return String(resp); } catch { return ''; }
+  }
+  // the JSON array in the reply, even if it's wrapped in ``` fences or extra words
+  function parseJsonArray(text) {
+    const t = String(text || '').replace(/```(?:json)?/gi, '').trim();
+    try { return JSON.parse(t); } catch {}
+    for (const [a, b] of [['[', ']'], ['{', '}']]) {
+      const i = t.indexOf(a), j = t.lastIndexOf(b);
+      if (i >= 0 && j > i) { try { return JSON.parse(t.slice(i, j + 1)); } catch {} }
+    }
+    throw Object.assign(new Error('The AI reply wasn\'t valid JSON'), { code: 'bad_json' });
+  }
+  const errCode = (e) => {
+    const parts = [e && e.code, e && e.status, e && e.error && (e.error.code || e.error.status), e && (e.message || (e.error && e.error.message)), typeof e === 'string' ? e : ''];
+    return parts.filter((x) => x != null && x !== '').join(' ').toLowerCase();
+  };
+  async function askAi(prompt) {
+    const ctrl = new AbortController();
+    const timer = setTimeout(() => ctrl.abort(), 90000);
+    try {
+      const resp = await window.puter.ai.chat(prompt, { signal: ctrl.signal });
+      return normalize(parseJsonArray(aiText(resp)));
+    } finally { clearTimeout(timer); }
+  }
+
   /* ---------- files: PDF, Word, text ---------- */
   const LIBS = {
     pdf: [['https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js', 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js'],
@@ -649,6 +751,7 @@ button{cursor:pointer}
     mMsg.classList.toggle('tall', mode === 'edit');
     $('#mHint').hidden = mode !== 'edit';
     mFiles = []; renderFileCards(); $('#mNote').hidden = true;
+    renderAiNote();
     $('#backdrop').hidden = false;
     setTimeout(() => {
       if (mode === 'project') { mProj.focus(); return; }
@@ -762,7 +865,7 @@ button{cursor:pointer}
 
     // Each upload is a feedback round (one saved message). Editing changes one round: rename the project
     // or the round if asked, save its message, then make tasks only from what's new in it.
-    let work = raw, batchId = mkId('m'), newRoundName = '';
+    let work = raw, batchId = mkId('m'), newRoundName = '', aiP = Promise.resolve(false);
     if (editing) {
       const bs = projectBatches(oldName);
       const idx = bs.findIndex((b) => b.id === modalBatchId), b = idx >= 0 ? bs[idx] : null;
@@ -773,6 +876,7 @@ button{cursor:pointer}
       if (!msgChanged && !renamed && !roundRenamed) { closeModal(); toast('No changes to save.'); return; }
       work = msgChanged ? addedText(oldText, raw) : '';
       if (b) batchId = b.id;
+      aiP = work ? ensureAi() : Promise.resolve(false); // must start inside the click (Puter sign-in opens a popup)
       closeModal();
       try {
         if (renamed) await renameProject(oldName, project);
@@ -787,6 +891,7 @@ button{cursor:pointer}
       }
     } else {
       newRoundName = typedRound || nextRoundName(project);
+      aiP = ensureAi(); // must start inside the click (Puter sign-in opens a popup)
       closeModal();
     }
 
@@ -797,18 +902,20 @@ button{cursor:pointer}
     state.creating = { project, raw: editing ? '' : raw, roundName: newRoundName, pct: 3, items: null, cap: 6 + 86 / parts.length };
     render(); startCoverage();
 
-    // Long documents go to Claude in parts, so every task keeps the client's exact words as its reference.
-    let items = [], fellBack = false;
-    if (sampleFn && smart !== 'denied' && smart !== 'off') {
+    // Long documents go to the AI in parts, so every task keeps the client's exact words as its reference.
+    let items = [], fellBack = false, aiProblem = '';
+    const useAi = await aiP;
+    if (!useAi) aiProblem = ai === 'off' ? 'The AI couldn\'t load, so it was split by sentence' : 'AI is off (no Puter sign-in), so it was split by sentence';
+    if (useAi) {
       const results = new Array(parts.length);
       let next = 0, finished = 0, stop = false;
       const ask = async (i, retried) => {
-        try { return normalize(await sampleFn.json(buildPrompt(parts[i], parts.length > 1), { modelTier: 'quick' })); }
+        try { return await askAi(buildPrompt(parts[i], parts.length > 1)); }
         catch (e) {
-          const code = e && e.code;
-          if (code === 'rate_limited' && !retried) { await new Promise((r) => setTimeout(r, 1500)); return ask(i, true); }
-          if (code === 'not_granted') { smart = 'denied'; stop = true; }
-          else if (['sampling_disabled', 'not_declared', 'capability_disabled', 'capability_removed'].includes(code)) { smart = 'off'; stop = true; }
+          const code = errCode(e);
+          if (/too_many_requests|rate_limit|429|timeout|abort/.test(code) && !retried) { await new Promise((r) => setTimeout(r, 2000)); return ask(i, true); }
+          if (/insufficient_funds|402/.test(code)) { stop = true; aiProblem = 'Your free Puter AI allowance is used up for now, so it was split by sentence'; }
+          else if (/auth/.test(code)) { stop = true; ai = 'signin'; renderAiNote(); }
           fellBack = true;
           return null;
         }
@@ -853,7 +960,8 @@ button{cursor:pointer}
     render();
     const asks = docs.filter((d) => d.data.status === 'ask').length;
     let msg = (editing ? `Message updated. Added ${plural(docs.length, 'task', 'tasks')}` : `Created ${plural(docs.length, 'task', 'tasks')} in ${newRoundName}`) + (asks ? `, ${asks} to ask the client` : '');
-    if (fellBack) msg += '. Claude didn\'t answer for part of it, so that part was split by sentence';
+    if (aiProblem) msg += '. ' + aiProblem;
+    else if (fellBack) msg += '. The AI didn\'t answer for part of it, so that part was split by sentence';
     toast(msg, 'Undo', async () => {
       if (!editing && state.keepRound === batchId) state.keepRound = null;
       await Promise.allSettled([...docs.map((d) => write('tasks', d.id, null, 'delete')), editing ? null : write('batches', batchId, null, 'delete')]);
@@ -1283,38 +1391,12 @@ button{cursor:pointer}
   state.proj = pref.get('proj');
 
   /* ---------- boot ---------- */
+  loadLocal();
+  state.tasks = [...local.tasks.values()]; state.batches = [...local.batches.values()]; state.meta = Object.fromEntries(local.meta);
+  state.loaded = true;
   render();
-  const use = (n) => (window.claude && typeof window.claude.use === 'function') ? Promise.resolve(window.claude.use(n)).catch(() => null) : Promise.resolve(null);
-  Promise.all([use('sample'), use('permissions')]).then(async ([s, p]) => {
-    sampleFn = s; perms = p;
-    if (!s) { smart = 'off'; return; }
-    try { const st = p ? await p.state('sample') : 'prompt'; smart = st === 'denied' ? 'denied' : st === 'unavailable' ? 'off' : 'on'; } catch { smart = 'on'; }
-  });
-  use('user').then(async (u) => {
-    if (!u || typeof u.can !== 'function') return;
-    try { const w = await u.can('data.write'); if (w === false) { state.readOnly = true; render(); } } catch {}
-  });
-  use('db').then((d) => {
-    if (!d) { state.loaded = true; render(); return; }
-    db = d;
-    let fresh = false;
-    const timer = setTimeout(() => { if (!fresh) { state.loaded = true; render(); toast('Can\'t reach your saved projects yet. They will appear when the connection is back.'); } }, 10000);
-    db.collection('tasks').onSnapshot((snap) => {
-      state.tasks = snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-      state.loaded = true;
-      if (!snap.metadata.fromCache) { fresh = true; clearTimeout(timer); }
-      render();
-    }, () => { clearTimeout(timer); state.loaded = true; render(); toast('Saved projects are unavailable right now.'); });
-    db.collection('batches').onSnapshot((snap) => {
-      state.batches = snap.docs.map((doc) => ({ id: doc.id, ...doc.data() }));
-      render();
-    }, () => {});
-    db.collection('meta').onSnapshot((snap) => {
-      state.meta = Object.fromEntries(snap.docs.map((doc) => [doc.id, doc.data()]));
-      render();
-    }, () => {});
-  });
+  loadPuter();
 })();
 </script>
-
-</body></html>
+</body>
+</html>
